@@ -8,7 +8,11 @@
 
 ## 下载
 
-到 [**Releases**](../../releases) 下载 `StartRide-Server-vX.X.X.zip`，解压得到：
+推荐：到 [**Releases**](../../releases) 下载 **`StartRide-Server-MediaCreator-win-x64.exe`**（Windows 制作工具）——
+像 Win10 安装媒体创建工具一样：选 U 盘 → 确认清空 → 一键把安装盘写进 U 盘。
+安装包已内置在工具里，无需联网；做出的 U 盘是**软件插件安装盘**（不是系统盘、不可引导）。
+
+或者直接下载 `StartRide-Server-vX.X.X.zip`，解压得到：
 
 ```
 StartRide-Server/
@@ -32,9 +36,15 @@ Ubuntu / Debian / CentOS / RHEL / Rocky / Alma / openEuler / Alibaba Cloud Linux
 
 ## 三步装好
 
+**方式 A · Windows 制作工具（推荐）**：双击 `StartRide-Server-MediaCreator-win-x64.exe` → 选 U 盘 → 勾选「确认清空」→ 开始制作。完成后安全弹出 U 盘。
+
+**方式 B · 手动拷贝**：把解压出的整个 `StartRide-Server` 文件夹拷到 U 盘。
+
+然后：
+
 ```bash
-# 1) 解压 zip，把整个 StartRide-Server 文件夹拷到 U 盘，插到服务器挂载
-# 2) 进入目录，执行：
+# 1) U 盘插到 Linux 服务器并挂载，进入目录
+# 2) 执行：
 sudo bash install.sh
 # 3) 按字符界面走完：环境检测（含硬件概览）→ 选网卡 → 端口 →
 #    建房向导（模式/地图/出生点/人数）→ 确认 → 安装 → 健康检查 → 摘要
