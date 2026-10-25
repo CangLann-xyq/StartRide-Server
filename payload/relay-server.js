@@ -6,6 +6,8 @@ const crypto = require("crypto");
 
 const fs = require("fs");
 
+const https = require("https");
+
 const TCP_PORT = process.env.PORT || 7777;
 
 const HTTP_PORT = process.env.HTTP_PORT || 7788;
@@ -76,6 +78,113 @@ function roomState(roomId) {
     gameModeRevision: r.meta.gameModeRevision || 0,
     lastActive: r.lastActive
   };
+}
+
+const LIVE_PLAYER_TTL = 3e4;
+
+const LIVE_ROOM_TTL = 6e5;
+
+const LIVE_IMPACT_MAX = 30;
+
+const liveRooms = new Map;
+
+const REGISTRY_TTL_MS = 3e5;
+
+const registry = new Map;
+
+function trackTelemetry(roomId, msg) {
+  if (msg.type === "vehicle") {
+    let lr = liveRooms.get(roomId);
+    if (!lr) {
+      lr = {
+        t: 0,
+        players: new Map,
+        impacts: []
+      };
+      liveRooms.set(roomId, lr);
+    }
+    lr.t = Date.now();
+    lr.players.set(String(msg.id || msg.name || "player"), {
+      name: String(msg.name || "").slice(0, 32),
+      model: String(msg.model || "").slice(0, 48),
+      map: String(msg.map || "").slice(0, 32),
+      pos: Array.isArray(msg.pos) ? msg.pos.slice(0, 3).map(Number) : [],
+      rot: Array.isArray(msg.rot) ? msg.rot.slice(0, 4).map(Number) : [],
+      vel: Array.isArray(msg.vel) ? msg.vel.slice(0, 3).map(Number) : [],
+      t: Date.now()
+    });
+    return;
+  }
+  if (msg.type === "mode-impact" || msg.type === "derby-damage") {
+    let lr = liveRooms.get(roomId);
+    if (!lr) {
+      lr = {
+        t: Date.now(),
+        players: new Map,
+        impacts: []
+      };
+      liveRooms.set(roomId, lr);
+    }
+    lr.t = Date.now();
+    lr.impacts.push({
+      t: Date.now(),
+      kind: msg.type,
+      by: String(msg.id || "").slice(0, 40),
+      target: String(msg.target || "").slice(0, 40),
+      damage: Math.max(0, Math.round(Number(msg.damage) || 0)),
+      speed: Math.max(0, Math.round(Number(msg.speed) || 0))
+    });
+    if (lr.impacts.length > LIVE_IMPACT_MAX) lr.impacts.splice(0, lr.impacts.length - LIVE_IMPACT_MAX);
+  }
+}
+
+function livePrune() {
+  const now = Date.now();
+  for (const [id, lr] of liveRooms) {
+    if (now - lr.t > LIVE_ROOM_TTL && !rooms.has(id)) {
+      liveRooms.delete(id);
+      continue;
+    }
+    for (const [pid, pl] of lr.players) {
+      if (now - pl.t > LIVE_PLAYER_TTL) lr.players.delete(pid);
+    }
+  }
+}
+
+setInterval(livePrune, 15e3).unref();
+
+function liveSnapshot() {
+  const now = Date.now();
+  const out = [];
+  for (const [id, r] of rooms) {
+    const lr = liveRooms.get(id);
+    const players = [];
+    if (lr) for (const [, pl] of lr.players) players.push(pl);
+    out.push({
+      id: id,
+      name: r.meta && (r.meta.roomName || r.meta.name) || id,
+      host: r.meta && r.meta.host || "",
+      mode: r.meta && r.meta.gameMode || "free_drive",
+      count: r.sockets.size,
+      capacity: r.meta && r.meta.capacity || 0,
+      players: players,
+      impacts: lr ? lr.impacts.filter(x => now - x.t < 6e4) : []
+    });
+  }
+  for (const [id, lr] of liveRooms) {
+    if (rooms.has(id) || lr.players.size === 0) continue;
+    out.push({
+      id: id,
+      name: id,
+      host: "",
+      mode: "free_drive",
+      count: 0,
+      capacity: 0,
+      players: Array.from(lr.players.values()),
+      impacts: []
+    });
+  }
+  return out;
 }
 
 function broadcast(roomId, msg, exceptSocket) {
@@ -363,6 +472,7 @@ function attachConnection(socket, via) {
           const me = r && r.sockets.get(socket);
           if (me && me.id) msg.id = me.id;
         }
+        trackTelemetry(roomId, msg);
         broadcast(roomId, msg, socket);
       }
     }
@@ -855,6 +965,74 @@ const httpServer = http.createServer(async (req, res) => {
     const r = closeRoom(String(body.roomId), body.by, body.token);
     return sendJSON(res, r.ok ? 200 : 400, r);
   }
+  if (path === "/api/startride/live") {
+    return sendJSON(res, 200, {
+      ok: true,
+      t: Date.now(),
+      rooms: liveSnapshot()
+    });
+  }
+  if (path === "/api/startride/servers" && req.method === "GET") {
+    const now = Date.now();
+    for (const [k, s] of registry) {
+      if (now - s.lastSeen > REGISTRY_TTL_MS) registry.delete(k);
+    }
+    const list = [ {
+      official: true,
+      name: "StartRide 官方服务器",
+      url: "",
+      map: "",
+      mode: "",
+      players: -1,
+      capacity: 0,
+      lastSeen: now
+    } ];
+    for (const [, s] of registry) list.push(s);
+    return sendJSON(res, 200, {
+      ok: true,
+      t: now,
+      servers: list
+    });
+  }
+  if (path === "/api/startride/servers/register" && req.method === "POST") {
+    const body = await readBody(req);
+    if (!body || !body.url) return sendJSON(res, 400, {
+      ok: false,
+      error: "missing url"
+    });
+    const now = Date.now();
+    const key = String(body.url).slice(0, 200).trim();
+    if (!/^http:\/\//.test(key)) return sendJSON(res, 400, {
+      ok: false,
+      error: "bad url"
+    });
+    const prev = registry.get(key);
+    if (prev && now - prev.lastSeen < 3e4) {
+      return sendJSON(res, 429, {
+        ok: false,
+        error: "too frequent"
+      });
+    }
+    if (!registry.has(key) && registry.size >= 100) {
+      return sendJSON(res, 400, {
+        ok: false,
+        error: "registry full"
+      });
+    }
+    registry.set(key, {
+      name: String(body.name || "StartRide 服务器").slice(0, 48),
+      url: key,
+      map: String(body.map || "").slice(0, 32),
+      mode: String(body.mode || "").slice(0, 24),
+      players: Math.max(0, parseInt(body.players, 10) || 0),
+      capacity: Math.max(0, parseInt(body.capacity, 10) || 0),
+      version: String(body.version || "").slice(0, 16),
+      lastSeen: now
+    });
+    return sendJSON(res, 200, {
+      ok: true
+    });
+  }
   if (await handleBoardApi(req, res, path)) return;
   sendJSON(res, 404, {
     ok: false,
@@ -871,6 +1049,64 @@ server.listen(TCP_PORT, "0.0.0.0", () => {
 httpServer.listen(HTTP_PORT, HTTP_HOST, () => {
   console.log(`[${(new Date).toISOString()}] StartRide relay control API + ws tunnel on ${HTTP_HOST}:${HTTP_PORT}`);
 });
+
+const REGISTRY_URL = process.env.SR_REGISTRY === "0" ? "" : process.env.SR_REGISTRY_URL || "https://startride.top/api/startride/servers/register";
+
+const PUBLIC_URL = String(process.env.SR_PUBLIC_URL || "").trim();
+
+function registryBeat() {
+  if (!REGISTRY_URL || !PUBLIC_URL) return;
+  let count = 0;
+  for (const [, r] of rooms) count += r.sockets.size;
+  let name = "", mode = "", map = "", capacity = 0;
+  if (typeof ROOM_PROFILE !== "undefined" && ROOM_PROFILE) {
+    name = ROOM_PROFILE.name || "";
+    mode = ROOM_PROFILE.gameMode || "";
+    map = ROOM_PROFILE.map || "";
+    capacity = Number(ROOM_PROFILE.capacity) || 0;
+  } else {
+    for (const [, r] of rooms) {
+      name = r.meta && (r.meta.roomName || r.meta.name) || name;
+      mode = r.meta && r.meta.gameMode || mode;
+      capacity = r.meta && r.meta.capacity || capacity;
+      break;
+    }
+  }
+  const body = JSON.stringify({
+    name: name || "StartRide 服务器",
+    url: PUBLIC_URL,
+    map: map,
+    mode: mode,
+    players: count,
+    capacity: capacity,
+    version: RELAY_VERSION
+  });
+  try {
+    const u = new URL(REGISTRY_URL);
+    const mod = u.protocol === "https:" ? https : http;
+    const req2 = mod.request({
+      hostname: u.hostname,
+      port: u.port || (u.protocol === "https:" ? 443 : 80),
+      path: u.pathname,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body)
+      },
+      timeout: 1e4
+    }, res2 => {
+      res2.resume();
+    });
+    req2.on("error", () => {});
+    req2.on("timeout", () => req2.destroy());
+    req2.end(body);
+  } catch (e) {}
+}
+
+if (REGISTRY_URL && PUBLIC_URL) {
+  setTimeout(registryBeat, 5e3).unref();
+  setInterval(registryBeat, 6e4).unref();
+}
 
 setInterval(() => {
   for (const [id, r] of rooms) {

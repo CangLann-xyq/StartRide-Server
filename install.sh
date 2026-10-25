@@ -480,6 +480,14 @@ SR_HTTP_HOST=0.0.0.0
 SR_HOST_GRACE_MS=$HOST_GRACE_MS
 SR_ROOM_CONFIG=/etc/start-ride/room.json
 EOF
+  SR_PUBLIC_URL=""
+  case "$PUBLIC_IP" in
+    *"<"*) : ;;
+    *) SR_PUBLIC_URL="http://$PUBLIC_IP:$HTTP_PORT" ;;
+  esac
+  if [ -n "$SR_PUBLIC_URL" ] && [ "$HAS_SYSTEMD" = 1 ]; then
+    echo "SR_PUBLIC_URL=$SR_PUBLIC_URL" >> /etc/start-ride/relay.env
+  fi
   write_room_profile
 
   progress $((++STEP)) $TOTAL "停止旧实例"
@@ -514,7 +522,7 @@ EOF
   else
     cat > "$INSTALL_DIR/start.sh" <<EOF
 #!/usr/bin/env bash
-SR_ROOM_CONFIG=/etc/start-ride/room.json nohup $NODE_BIN $INSTALL_DIR/relay-server.js >> $INSTALL_DIR/relay.log 2>&1 &
+SR_ROOM_CONFIG=/etc/start-ride/room.json SR_PUBLIC_URL=$SR_PUBLIC_URL nohup $NODE_BIN $INSTALL_DIR/relay-server.js >> $INSTALL_DIR/relay.log 2>&1 &
 EOF
     chmod +x "$INSTALL_DIR/start.sh"
   fi
