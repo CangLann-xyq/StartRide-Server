@@ -14,7 +14,7 @@ const HTTP_PORT = process.env.HTTP_PORT || 7788;
 
 const HTTP_HOST = process.env.SR_HTTP_HOST || "127.0.0.1";
 
-const RELAY_VERSION = "2.6.1";
+const RELAY_VERSION = "2.7.0";
 
 const ROOM_TTL_MS = 90 * 1e3;
 
@@ -92,6 +92,73 @@ const REGISTRY_TTL_MS = 3e5;
 
 const registry = new Map;
 
+const AGGREGATE = process.env.SR_AGGREGATE !== "0";
+
+const AGG_INTERVAL_MS = 2e4;
+
+const AGG_TIMEOUT_MS = 6e3;
+
+const AGG_MAX_SERVERS = 24;
+
+const remoteLive = new Map;
+
+function aggFetchOne(url) {
+  let u;
+  try {
+    u = new URL(url);
+  } catch (e) {
+    return;
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return;
+  const mod = u.protocol === "https:" ? https : http;
+  const req2 = mod.request({
+    hostname: u.hostname,
+    port: u.port || (u.protocol === "https:" ? 443 : 80),
+    path: "/api/startride/live",
+    method: "GET",
+    timeout: AGG_TIMEOUT_MS
+  }, res2 => {
+    let b = "";
+    res2.on("data", c => {
+      b += c;
+      if (b.length > 1048576) req2.destroy();
+    });
+    res2.on("end", () => {
+      try {
+        const d = JSON.parse(b);
+        const list = Array.isArray(d && d.rooms) ? d.rooms : [];
+        remoteLive.set(url, {
+          url: url,
+          rooms: list,
+          ts: Date.now()
+        });
+      } catch (e) {
+        remoteLive.delete(url);
+      }
+    });
+  });
+  req2.on("error", () => {});
+  req2.on("timeout", () => req2.destroy());
+  req2.end();
+}
+
+function aggTick() {
+  if (!AGGREGATE) return;
+  const now = Date.now();
+  for (const [k, v] of remoteLive) {
+    if (now - v.ts > 9e4) remoteLive.delete(k);
+  }
+  let n = 0;
+  for (const [k, s] of registry) {
+    if (now - s.lastSeen > REGISTRY_TTL_MS) continue;
+    if (n >= AGG_MAX_SERVERS) break;
+    n++;
+    aggFetchOne(k);
+  }
+}
+
+if (AGGREGATE) setInterval(aggTick, AGG_INTERVAL_MS).unref();
+
 function trackTelemetry(roomId, msg) {
   if (msg.type === "vehicle") {
     let lr = liveRooms.get(roomId);
@@ -105,6 +172,7 @@ function trackTelemetry(roomId, msg) {
     }
     lr.t = Date.now();
     lr.players.set(String(msg.id || msg.name || "player"), {
+      id: String(msg.id || "").slice(0, 40),
       name: String(msg.name || "").slice(0, 32),
       model: String(msg.model || "").slice(0, 48),
       map: String(msg.map || "").slice(0, 32),
@@ -184,7 +252,26 @@ function liveSnapshot() {
       impacts: []
     });
   }
+  for (const [, pack] of remoteLive) {
+    if (Date.now() - pack.ts > 9e4) continue;
+    for (const r of pack.rooms) {
+      if (!r || r.via) continue;
+      if (!(r.count > 0 || Array.isArray(r.players) && r.players.length)) continue;
+      out.push(Object.assign({}, r, {
+        via: urlHostOf(pack.url)
+      }));
+    }
+  }
   return out;
+}
+
+function urlHostOf(u) {
+  try {
+    const x = new URL(u);
+    return x.host;
+  } catch (e) {
+    return "";
+  }
 }
 
 function broadcast(roomId, msg, exceptSocket) {
